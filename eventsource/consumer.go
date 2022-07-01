@@ -2,7 +2,6 @@ package eventsource
 
 import (
 	"compress/gzip"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 )
 
 type consumer struct {
+	group  string
 	conn   io.WriteCloser
 	es     *eventSource
 	in     chan []byte
@@ -45,14 +45,14 @@ func newConsumer(resp http.ResponseWriter, req *http.Request, es *eventSource) (
 	if err != nil {
 		return nil, err
 	}
-
 	consumer := &consumer{
+		group:  req.URL.Query().Get("id"),
 		conn:   conn,
 		es:     es,
 		in:     make(chan []byte, 10),
 		staled: false,
 	}
-	fmt.Println("init new consumer", consumer)
+	//fmt.Println("init new consumer", consumer)
 
 	_, err = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"))
 	if err != nil {
@@ -108,6 +108,7 @@ func newConsumer(resp http.ResponseWriter, req *http.Request, es *eventSource) (
 					return
 				}
 				conn.SetWriteDeadline(time.Now().Add(consumer.es.timeout))
+				//fmt.Println(string(message))
 				_, err := consumer.conn.Write(message)
 				if err != nil {
 					netErr, ok := err.(net.Error)

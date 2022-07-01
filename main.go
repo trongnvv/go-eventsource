@@ -20,9 +20,10 @@ func main() {
 	defer es.Close()
 
 	http.Handle("/events", es)
+
 	go func() {
 		for {
-			es.SendEventMessage("hello", "", "")
+			es.SendEventMessage("abcd", "hello", "")
 			//log.Printf("Hello has been sent (consumers: %d)", es.ConsumersCount())
 			time.Sleep(2 * time.Second)
 		}

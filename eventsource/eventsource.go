@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/list"
 	"fmt"
+	"github.com/google/uuid"
 	"log"
 	"net/http"
 	"strings"
@@ -12,9 +13,10 @@ import (
 )
 
 type eventMessage struct {
-	id    string
-	event string
-	data  string
+	channel string
+	id      string
+	event   string
+	data    string
 }
 
 type retryMessage struct {
@@ -35,7 +37,7 @@ type eventSource struct {
 	gzip           bool
 
 	consumersLock sync.RWMutex
-	consumers     *list.List
+	consumers     map[string]*list.List
 }
 
 type Settings struct {
@@ -75,19 +77,19 @@ func DefaultSettings() *Settings {
 
 // EventSource interface provides methods for sending messages and closing all connections.
 type EventSource interface {
-	// it should implement ServerHTTP method
+	// Handler it should implement ServerHTTP method
 	http.Handler
 
-	// send message to all consumers
-	SendEventMessage(data, event, id string)
+	// SendEventMessage send message to all consumers
+	SendEventMessage(channel, data, event string)
 
-	// send retry message to all consumers
+	// SendRetryMessage send retry message to all consumers
 	SendRetryMessage(duration time.Duration)
 
-	// consumers count
+	// ConsumersCount count consumers count
 	ConsumersCount() int
 
-	// close and clear all consumers
+	// Close and clear all consumers
 	Close()
 }
 
@@ -118,11 +120,18 @@ func controlProcess(es *eventSource) {
 	for {
 		select {
 		case em := <-es.sink:
+			channel := em.(*eventMessage).channel
+			_, ok := es.consumers[channel]
+			if !ok {
+				break
+			}
 			message := em.prepareMessage()
+
 			func() {
 				es.consumersLock.RLock()
 				defer es.consumersLock.RUnlock()
-				for e := es.consumers.Front(); e != nil; e = e.Next() {
+				// send all group consumers via channel
+				for e := es.consumers[channel].Front(); e != nil; e = e.Next() {
 					c := e.Value.(*consumer)
 
 					// Only send this message if the consumer isn't staled
@@ -143,32 +152,50 @@ func controlProcess(es *eventSource) {
 			func() {
 				es.consumersLock.RLock()
 				defer es.consumersLock.RUnlock()
+				for group := range es.consumers {
+					fmt.Println("close data consumers group:", group)
 
-				for e := es.consumers.Front(); e != nil; e = e.Next() {
-					c := e.Value.(*consumer)
-					close(c.in)
+					for e := es.consumers[group].Front(); e != nil; e = e.Next() {
+						c := e.Value.(*consumer)
+						close(c.in)
+					}
+				}
+			}()
+			func() {
+				es.consumersLock.Lock()
+				defer es.consumersLock.Unlock()
+				for group := range es.consumers {
+					fmt.Println("close group:", group)
+					es.consumers[group].Init()
+					delete(es.consumers, group)
 				}
 			}()
 
-			es.consumersLock.Lock()
-			defer es.consumersLock.Unlock()
-
-			es.consumers.Init()
 			return
 		case c := <-es.add:
 			func() {
 				es.consumersLock.Lock()
 				defer es.consumersLock.Unlock()
-
-				es.consumers.PushBack(c)
+				_, ok := es.consumers[c.group]
+				if !ok {
+					es.consumers[c.group] = list.New()
+				} else {
+					//fmt.Println("add consumer", es.consumers[c.group].Len())
+				}
+				es.consumers[c.group].PushBack(c)
 			}()
 		case c := <-es.staled:
 			toRemoveEls := make([]*list.Element, 0, 1)
+			_, ok := es.consumers[c.group]
+			if !ok {
+				break
+			}
+
 			func() {
 				es.consumersLock.RLock()
 				defer es.consumersLock.RUnlock()
 
-				for e := es.consumers.Front(); e != nil; e = e.Next() {
+				for e := es.consumers[c.group].Front(); e != nil; e = e.Next() {
 					if e.Value.(*consumer) == c {
 						toRemoveEls = append(toRemoveEls, e)
 					}
@@ -179,8 +206,13 @@ func controlProcess(es *eventSource) {
 				defer es.consumersLock.Unlock()
 
 				for _, e := range toRemoveEls {
-					es.consumers.Remove(e)
+					es.consumers[c.group].Remove(e)
 				}
+				if es.consumers[c.group].Len() == 0 {
+					delete(es.consumers, c.group)
+				}
+				//fmt.Println("len group", c.group, es.consumers[c.group].Len())
+
 			}()
 			close(c.in)
 		}
@@ -199,7 +231,7 @@ func New(settings *Settings, customHeadersFunc func(*http.Request) [][]byte) Eve
 	es.close = make(chan bool)
 	es.staled = make(chan *consumer, 1)
 	es.add = make(chan *consumer)
-	es.consumers = list.New()
+	es.consumers = make(map[string]*list.List)
 	es.timeout = settings.Timeout
 	es.idleTimeout = settings.IdleTimeout
 	es.closeOnTimeout = settings.CloseOnTimeout
@@ -212,11 +244,28 @@ func (es *eventSource) Close() {
 	es.close <- true
 }
 
+func (es *eventSource) auth(accessToken string) bool {
+	return true
+}
+
 // ServeHTTP implements http.Handler interface.
 func (es *eventSource) ServeHTTP(resp http.ResponseWriter, req *http.Request) {
+	if !es.auth(req.URL.Query().Get("access_token")) {
+		resp.Header().Set("Access-Control-Allow-Origin", "*")
+		resp.Header().Set("Content-Type", "text/event-stream")
+		resp.Header().Set("Cache-Control", "no-cache")
+		resp.Header().Set("Connection", "keep-alive")
+		http.Error(resp, "Unauthorized!", http.StatusUnauthorized)
+		return
+	}
 	cons, err := newConsumer(resp, req, es)
 	if err != nil {
 		log.Print("Can't create connection to a consumer: ", err)
+		resp.Header().Set("Access-Control-Allow-Origin", "*")
+		resp.Header().Set("Content-Type", "text/event-stream")
+		resp.Header().Set("Cache-Control", "no-cache")
+		resp.Header().Set("Connection", "keep-alive")
+		http.Error(resp, "InternalServerError!", http.StatusInternalServerError)
 		return
 	}
 	es.add <- cons
@@ -226,8 +275,10 @@ func (es *eventSource) sendMessage(m message) {
 	es.sink <- m
 }
 
-func (es *eventSource) SendEventMessage(data, event, id string) {
-	em := &eventMessage{id, event, data}
+func (es *eventSource) SendEventMessage(channel, data, event string) {
+	id := uuid.New()
+	em := &eventMessage{channel, id.String(), event, data}
+	fmt.Println("send message", em)
 	es.sendMessage(em)
 }
 
@@ -242,6 +293,9 @@ func (es *eventSource) SendRetryMessage(t time.Duration) {
 func (es *eventSource) ConsumersCount() int {
 	es.consumersLock.RLock()
 	defer es.consumersLock.RUnlock()
-
-	return es.consumers.Len()
+	total := 0
+	for _, v := range es.consumers {
+		total += v.Len()
+	}
+	return total
 }

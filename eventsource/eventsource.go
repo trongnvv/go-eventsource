@@ -3,8 +3,11 @@ package eventsource
 import (
 	"bytes"
 	"container/list"
+	"encoding/json"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/nats-io/nats.go"
+	"github.com/patrickmn/go-cache"
 	"log"
 	"net/http"
 	"strings"
@@ -12,11 +15,11 @@ import (
 	"time"
 )
 
-type eventMessage struct {
-	channel string
-	id      string
-	event   string
-	data    string
+type EventMessage struct {
+	Channel string
+	Id      string
+	Event   string
+	Data    string
 }
 
 type retryMessage struct {
@@ -35,9 +38,11 @@ type eventSource struct {
 	timeout        time.Duration
 	closeOnTimeout bool
 	gzip           bool
-
-	consumersLock sync.RWMutex
-	consumers     map[string]*list.List
+	natsConn       *nats.Conn
+	cache          *cache.Cache
+	consumersLock  sync.RWMutex
+	topic          string
+	consumers      map[string]*list.List
 }
 
 type Settings struct {
@@ -63,7 +68,9 @@ type Settings struct {
 	// support it.
 	//
 	// The default is false.
-	Gzip bool
+	Gzip    bool
+	NatsURL string
+	Topic   string
 }
 
 func DefaultSettings() *Settings {
@@ -72,6 +79,8 @@ func DefaultSettings() *Settings {
 		CloseOnTimeout: true,
 		IdleTimeout:    30 * time.Minute,
 		Gzip:           false,
+		NatsURL:        "",
+		Topic:          "default",
 	}
 }
 
@@ -81,7 +90,8 @@ type EventSource interface {
 	http.Handler
 
 	// SendEventMessage send message to all consumers
-	SendEventMessage(channel, data, event string)
+	SendEventMessage(channel, id, data, event string)
+	//SendEventMessage(em *EventMessage)
 
 	// SendRetryMessage send retry message to all consumers
 	SendRetryMessage(duration time.Duration)
@@ -98,16 +108,16 @@ type message interface {
 	prepareMessage() []byte
 }
 
-func (m *eventMessage) prepareMessage() []byte {
+func (m *EventMessage) prepareMessage() []byte {
 	var data bytes.Buffer
-	if len(m.id) > 0 {
-		data.WriteString(fmt.Sprintf("id: %s\n", strings.Replace(m.id, "\n", "", -1)))
+	if len(m.Id) > 0 {
+		data.WriteString(fmt.Sprintf("id: %s\n", strings.Replace(m.Id, "\n", "", -1)))
 	}
-	if len(m.event) > 0 {
-		data.WriteString(fmt.Sprintf("event: %s\n", strings.Replace(m.event, "\n", "", -1)))
+	if len(m.Event) > 0 {
+		data.WriteString(fmt.Sprintf("event: %s\n", strings.Replace(m.Event, "\n", "", -1)))
 	}
-	if len(m.data) > 0 {
-		lines := strings.Split(m.data, "\n")
+	if len(m.Data) > 0 {
+		lines := strings.Split(m.Data, "\n")
 		for _, line := range lines {
 			data.WriteString(fmt.Sprintf("data: %s\n", line))
 		}
@@ -120,7 +130,7 @@ func controlProcess(es *eventSource) {
 	for {
 		select {
 		case em := <-es.sink:
-			channel := em.(*eventMessage).channel
+			channel := em.(*EventMessage).Channel
 			_, ok := es.consumers[channel]
 			if !ok {
 				break
@@ -226,6 +236,14 @@ func New(settings *Settings, customHeadersFunc func(*http.Request) [][]byte) Eve
 	}
 
 	es := new(eventSource)
+	if settings.NatsURL != "" {
+		nc, err := nats.Connect(settings.NatsURL)
+		if err != nil {
+			log.Fatalf("nats url connect fail %v", err)
+		}
+		es.natsConn = nc
+	}
+
 	es.customHeadersFunc = customHeadersFunc
 	es.sink = make(chan message, 1)
 	es.close = make(chan bool)
@@ -236,8 +254,32 @@ func New(settings *Settings, customHeadersFunc func(*http.Request) [][]byte) Eve
 	es.idleTimeout = settings.IdleTimeout
 	es.closeOnTimeout = settings.CloseOnTimeout
 	es.gzip = settings.Gzip
+	es.topic = settings.Topic
+	es.cache = cache.New(time.Minute, 2*time.Minute)
+	if es.natsConn != nil {
+		go adapters(es)
+	}
 	go controlProcess(es)
 	return es
+}
+
+func adapters(es *eventSource) {
+	_, err := es.natsConn.Subscribe("sse.adapters."+es.topic, func(m *nats.Msg) {
+		fmt.Printf("Received a message: %s\n", string(m.Data))
+		var em *EventMessage
+		err := json.Unmarshal(m.Data, &em)
+		if err != nil {
+			return
+		}
+		//fmt.Printf("Received a message: %s\n", em)
+		if _, found := es.cache.Get(es.topic + em.Id); !found {
+			es.cache.Set(es.topic+em.Id, "existed", cache.DefaultExpiration)
+			es.sendMessage(em)
+		}
+	})
+	if err != nil {
+		return
+	}
 }
 
 func (es *eventSource) Close() {
@@ -275,10 +317,15 @@ func (es *eventSource) sendMessage(m message) {
 	es.sink <- m
 }
 
-func (es *eventSource) SendEventMessage(channel, data, event string) {
-	id := uuid.New()
-	em := &eventMessage{channel, id.String(), event, data}
-	fmt.Println("send message", em)
+func (es *eventSource) SendEventMessage(channel, id, data, event string) {
+	if id == "" {
+		id = uuid.New().String()
+	}
+
+	em := &EventMessage{channel, id, event, data}
+	es.cache.Set(es.topic+id, "existed", cache.DefaultExpiration)
+	dataPub, _ := json.Marshal(em)
+	_ = es.natsConn.Publish("sse.adapters."+es.topic, dataPub)
 	es.sendMessage(em)
 }
 

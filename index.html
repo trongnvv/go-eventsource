@@ -4,7 +4,7 @@
     <title>SSE test</title>
     <script type="text/javascript">
         window.addEventListener("DOMContentLoaded", function () {
-            let event = new EventSource("http://localhost:8000/events?access_token=trongnv&id=abcd");
+            let event = new EventSource("http://localhost:8002/events?access_token=trongnv&id=abcd");
             event.onmessage = function (ev) {
                 console.log('ev', ev)
                 document.getElementById("log")

@@ -22,6 +22,9 @@ func main() {
 		Gzip:           false,
 		NatsURL:        nats.DefaultURL,
 		Topic:          "default",
+		AuthFunc: func(token string) bool {
+			return true
+		},
 	}
 
 	es := eventsource.New(

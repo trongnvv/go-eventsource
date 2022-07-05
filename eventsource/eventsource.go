@@ -43,6 +43,7 @@ type eventSource struct {
 	consumersLock  sync.RWMutex
 	topic          string
 	consumers      map[string]*list.List
+	authFunc       func(token string) bool
 }
 
 type Settings struct {
@@ -68,9 +69,10 @@ type Settings struct {
 	// support it.
 	//
 	// The default is false.
-	Gzip    bool
-	NatsURL string
-	Topic   string
+	Gzip     bool
+	NatsURL  string
+	Topic    string
+	AuthFunc func(token string) bool
 }
 
 func DefaultSettings() *Settings {
@@ -255,6 +257,7 @@ func New(settings *Settings, customHeadersFunc func(*http.Request) [][]byte) Eve
 	es.closeOnTimeout = settings.CloseOnTimeout
 	es.gzip = settings.Gzip
 	es.topic = settings.Topic
+	es.authFunc = settings.AuthFunc
 	es.cache = cache.New(time.Minute, 2*time.Minute)
 	if es.natsConn != nil {
 		go adapters(es)
@@ -286,13 +289,9 @@ func (es *eventSource) Close() {
 	es.close <- true
 }
 
-func (es *eventSource) auth(accessToken string) bool {
-	return true
-}
-
 // ServeHTTP implements http.Handler interface.
 func (es *eventSource) ServeHTTP(resp http.ResponseWriter, req *http.Request) {
-	if !es.auth(req.URL.Query().Get("access_token")) {
+	if !es.authFunc(req.URL.Query().Get("access_token")) {
 		resp.Header().Set("Access-Control-Allow-Origin", "*")
 		resp.Header().Set("Content-Type", "text/event-stream")
 		resp.Header().Set("Cache-Control", "no-cache")
@@ -323,10 +322,13 @@ func (es *eventSource) SendEventMessage(channel, id, data, event string) {
 	}
 
 	em := &EventMessage{channel, id, event, data}
-	es.cache.Set(es.topic+id, "existed", cache.DefaultExpiration)
-	dataPub, _ := json.Marshal(em)
-	_ = es.natsConn.Publish("sse.adapters."+es.topic, dataPub)
 	es.sendMessage(em)
+
+	if es.natsConn != nil {
+		es.cache.Set(es.topic+id, "existed", cache.DefaultExpiration)
+		dataPub, _ := json.Marshal(em)
+		_ = es.natsConn.Publish("sse.adapters."+es.topic, dataPub)
+	}
 }
 
 func (m *retryMessage) prepareMessage() []byte {
